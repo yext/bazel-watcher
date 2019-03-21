@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package main
+package ibazel
 
 import (
 	"bytes"
@@ -29,7 +29,6 @@ import (
 	"github.com/bazelbuild/bazel-watcher/ibazel/command"
 	"github.com/bazelbuild/bazel-watcher/ibazel/live_reload"
 	"github.com/bazelbuild/bazel-watcher/ibazel/output_runner"
-	"github.com/bazelbuild/bazel-watcher/ibazel/profiler"
 	"github.com/bazelbuild/bazel-watcher/ibazel/workspace_finder"
 	"github.com/fsnotify/fsnotify"
 
@@ -79,7 +78,7 @@ type IBazel struct {
 	state State
 }
 
-func New() (*IBazel, error) {
+func New(listeners ...Lifecycle) (*IBazel, error) {
 	i := &IBazel{}
 	err := i.setup()
 	if err != nil {
@@ -94,15 +93,15 @@ func New() (*IBazel, error) {
 	signal.Notify(i.sigs, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
 
 	liveReload := live_reload.New()
-	profiler := profiler.New(Version)
 	outputRunner := output_runner.New()
-
-	liveReload.AddEventsListener(profiler)
 
 	i.lifecycleListeners = []Lifecycle{
 		liveReload,
-		profiler,
 		outputRunner,
+	}
+
+	if listeners != nil {
+		i.lifecycleListeners = append(i.lifecycleListeners, listeners...)
 	}
 
 	info, _ := i.getInfo()
