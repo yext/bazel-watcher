@@ -39,7 +39,7 @@ go_library(
         "source_event_handler.go",
     ],
     importpath = "github.com/bazelbuild/bazel-watcher/ibazel",
-    visibility = ["//visibility:private"],
+    visibility = ["//visibility:public"],
     deps = [
         "//bazel:go_default_library",
         "//ibazel/command:go_default_library",
