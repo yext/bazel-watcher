@@ -22,13 +22,12 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
 	"github.com/bazelbuild/bazel-watcher/bazel"
 	"github.com/bazelbuild/bazel-watcher/ibazel/command"
-	"github.com/bazelbuild/bazel-watcher/ibazel/live_reload"
-	"github.com/bazelbuild/bazel-watcher/ibazel/output_runner"
 	"github.com/bazelbuild/bazel-watcher/ibazel/workspace_finder"
 	"github.com/fsnotify/fsnotify"
 
@@ -64,6 +63,7 @@ type IBazel struct {
 
 	sigs           chan os.Signal // Signals channel for the current process
 	interruptCount int
+	StopChan       chan bool // Channel for ceasing a build loop
 
 	workspaceFinder workspace_finder.WorkspaceFinder
 
@@ -74,11 +74,12 @@ type IBazel struct {
 
 	sourceEventHandler *SourceEventHandler
 	lifecycleListeners []Lifecycle
+	listenersLock      *sync.Mutex
 
 	state State
 }
 
-func New(listeners ...Lifecycle) (*IBazel, error) {
+func New() (*IBazel, error) {
 	i := &IBazel{}
 	err := i.setup()
 	if err != nil {
@@ -91,23 +92,8 @@ func New(listeners ...Lifecycle) (*IBazel, error) {
 
 	i.sigs = make(chan os.Signal, 1)
 	signal.Notify(i.sigs, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
-
-	liveReload := live_reload.New()
-	outputRunner := output_runner.New()
-
-	i.lifecycleListeners = []Lifecycle{
-		liveReload,
-		outputRunner,
-	}
-
-	if listeners != nil {
-		i.lifecycleListeners = append(i.lifecycleListeners, listeners...)
-	}
-
-	info, _ := i.getInfo()
-	for _, l := range i.lifecycleListeners {
-		l.Initialize(info)
-	}
+	i.StopChan = make(chan bool, 1)
+	i.listenersLock = &sync.Mutex{}
 
 	go func() {
 		for {
@@ -170,15 +156,28 @@ func (i *IBazel) SetDebounceDuration(debounceDuration time.Duration) {
 	i.debounceDuration = debounceDuration
 }
 
+func (i *IBazel) SetLifecycleListeners(listeners []Lifecycle) {
+	i.listenersLock.Lock()
+	i.lifecycleListeners = listeners
+	info, _ := i.getInfo()
+	for _, l := range i.lifecycleListeners {
+		l.Initialize(info)
+	}
+	i.listenersLock.Unlock()
+}
+
 func (i *IBazel) Cleanup() {
 	i.buildFileWatcher.Close()
 	i.sourceFileWatcher.Close()
+	i.listenersLock.Lock()
 	for _, l := range i.lifecycleListeners {
 		l.Cleanup()
 	}
+	i.listenersLock.Unlock()
 }
 
 func (i *IBazel) targetDecider(target string, rule *blaze_query.Rule) {
+	i.listenersLock.Lock()
 	for _, l := range i.lifecycleListeners {
 		// TODO: As the name implies, it would be good to use this to make a
 		// determination about if future events should be routed to this listener.
@@ -194,24 +193,31 @@ func (i *IBazel) targetDecider(target string, rule *blaze_query.Rule) {
 		// and then running a background thread to access the data.
 		l.TargetDecider(rule)
 	}
+	i.listenersLock.Unlock()
 }
 
 func (i *IBazel) changeDetected(targets []string, changeType string, change string) {
+	i.listenersLock.Lock()
 	for _, l := range i.lifecycleListeners {
 		l.ChangeDetected(targets, changeType, change)
 	}
+	i.listenersLock.Unlock()
 }
 
 func (i *IBazel) beforeCommand(targets []string, command string) {
+	i.listenersLock.Lock()
 	for _, l := range i.lifecycleListeners {
 		l.BeforeCommand(targets, command)
 	}
+	i.listenersLock.Unlock()
 }
 
 func (i *IBazel) afterCommand(targets []string, command string, success bool, output *bytes.Buffer) {
+	i.listenersLock.Lock()
 	for _, l := range i.lifecycleListeners {
 		l.AfterCommand(targets, command, success, output)
 	}
+	i.listenersLock.Unlock()
 }
 
 func (i *IBazel) setup() error {
@@ -254,7 +260,7 @@ func (i *IBazel) loop(command string, commandToRun runnableCommand, targets []st
 	joinedTargets := strings.Join(targets, " ")
 
 	i.state = QUERY
-	for {
+	for i.state != QUIT {
 		i.iteration(command, commandToRun, targets, joinedTargets)
 	}
 
@@ -281,6 +287,8 @@ func (i *IBazel) iteration(command string, commandToRun runnableCommand, targets
 				i.changeDetected(targets, "graph", e.Name)
 				i.state = DEBOUNCE_QUERY
 			}
+		case <-i.StopChan:
+			i.state = QUIT
 		}
 	case DEBOUNCE_QUERY:
 		select {
@@ -475,6 +483,7 @@ func (i *IBazel) watchFiles(query string, watcher fSNotifyWatcher) {
 	filesFound := map[string]struct{}{}
 	filesWatched := map[string]struct{}{}
 	uniqueDirectories := map[string]struct{}{}
+	removedDirectories := map[string]struct{}{}
 
 	for _, file := range toWatch {
 		if _, err := os.Stat(file); !os.IsNotExist(err) {
@@ -505,11 +514,13 @@ func (i *IBazel) watchFiles(query string, watcher fSNotifyWatcher) {
 		parentDirectory, _ := filepath.Split(file)
 
 		// Remove the watch from the parent directory if it no longer contains any files returned by the latest query
-		if _, ok := uniqueDirectories[parentDirectory]; !ok {
+		_, removed := removedDirectories[parentDirectory]
+		if _, ok := uniqueDirectories[parentDirectory]; !ok && !removed {
 			err := watcher.Remove(parentDirectory)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "Error unwatching file %v\nError: %v\n", file, err)
 			}
+			removedDirectories[parentDirectory] = struct{}{}
 		}
 	}
 
